@@ -77,17 +77,26 @@ def load_and_clean_excel(file) -> pd.DataFrame:
         return pd.DataFrame()
 
 def make_df_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
-    df_safe = df.copy()
+    df_safe = df.copy(deep=True)
 
+    # ✅ 1. FORCE SAFE STRING COLUMN NAMES
+    df_safe.columns = [str(c) for c in df_safe.columns]
+
+    # ✅ 2. RESET INDEX (Arrow METADATA FIX)
+    df_safe = df_safe.reset_index(drop=True)
+
+    # ✅ 3. FORCE ALL VALUES TO PURE PYTHON SCALARS
     for col in df_safe.columns:
-        # Convert any non-serializable object into safe string
-        df_safe[col] = df_safe[col].apply(
-            lambda x: json.dumps(x, default=str) if isinstance(x, (dict, list, tuple, set)) else x
+        df_safe[col] = df_safe[col].map(
+            lambda x: (
+                json.dumps(x, default=str)
+                if isinstance(x, (dict, list, tuple, set))
+                else str(x) if pd.notna(x) else ""
+            )
         )
 
-        # Force mixed object columns to string
-        if df_safe[col].dtype == "object":
-            df_safe[col] = df_safe[col].astype(str)
+    # ✅ 4. FORCE ENTIRE FRAME TO STRING
+    df_safe = df_safe.astype(str)
 
     return df_safe
 
@@ -223,7 +232,7 @@ def main():
     st.success("Excel cleaned successfully")
 
     with st.expander("🔍 Preview Cleaned Data"):
-        st.dataframe(make_df_arrow_safe(df))
+        safe_df = make_df_arrow_safe(df) st.dataframe(safe_df)
 
     if not st.sidebar.button("Run Multi-Agent Analysis"):
         return
@@ -252,7 +261,7 @@ def main():
             st.dataframe(corr_matrix)
 
     with tabs[4]:
-        st.dataframe(make_df_arrow_safe(df))
+        safe_df = make_df_arrow_safe(df) st.dataframe(safe_df) st.download_button(     "Download Clean CSV",     safe_df.to_csv(index=False),     "cleaned_data.csv",     "text/csv" )
         st.download_button("Download Clean CSV",
                            make_df_arrow_safe(df).to_csv(index=False),
                            "cleaned_data.csv",
@@ -261,4 +270,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
