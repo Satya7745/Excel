@@ -76,6 +76,20 @@ def load_and_clean_excel(file) -> pd.DataFrame:
         st.error(str(e))
         return pd.DataFrame()
 
+def make_df_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
+    df_safe = df.copy()
+
+    for col in df_safe.columns:
+        # Convert any non-serializable object into safe string
+        df_safe[col] = df_safe[col].apply(
+            lambda x: json.dumps(x, default=str) if isinstance(x, (dict, list, tuple, set)) else x
+        )
+
+        # Force mixed object columns to string
+        if df_safe[col].dtype == "object":
+            df_safe[col] = df_safe[col].astype(str)
+
+    return df_safe
 
 # =========================
 # ✅ AGENT 1 — METRICS
@@ -209,7 +223,7 @@ def main():
     st.success("Excel cleaned successfully")
 
     with st.expander("🔍 Preview Cleaned Data"):
-        st.dataframe(df)
+        st.dataframe(make_df_arrow_safe(df))
 
     if not st.sidebar.button("Run Multi-Agent Analysis"):
         return
@@ -238,12 +252,13 @@ def main():
             st.dataframe(corr_matrix)
 
     with tabs[4]:
-        st.dataframe(df)
+        st.dataframe(make_df_arrow_safe(df))
         st.download_button("Download Clean CSV",
-                           df.to_csv(index=False),
+                           make_df_arrow_safe(df).to_csv(index=False),
                            "cleaned_data.csv",
                            "text/csv")
 
 
 if __name__ == "__main__":
     main()
+
