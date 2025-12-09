@@ -105,16 +105,22 @@ def get_numeric_and_categorical(df):
 async def visualization_agent(df, date_col, target_col, group_col):
     out = {"time_series": None, "distributions": [], "category_charts": []}
 
-    if date_col and target_col:
+    # ✅ HARD COLUMN EXISTENCE CHECK
+    if date_col in df.columns and target_col in df.columns:
         tmp = df[[date_col, target_col]].dropna()
-        tmp[date_col] = pd.to_datetime(tmp[date_col])
-        out["time_series"] = px.line(tmp, x=date_col, y=target_col)
+        if not tmp.empty:
+            tmp[date_col] = pd.to_datetime(tmp[date_col], errors="coerce")
+            out["time_series"] = px.line(tmp, x=date_col, y=target_col)
 
     numeric, _ = get_numeric_and_categorical(df)
+
     for col in numeric[:6]:
         out["distributions"].append((col, px.histogram(df, x=col)))
 
-    if target_col and group_col:
+    if (
+        target_col in df.columns
+        and group_col in df.columns
+    ):
         grp = df.groupby(group_col)[target_col].mean().reset_index()
         out["category_charts"].append(px.bar(grp, x=group_col, y=target_col))
 
@@ -123,18 +129,25 @@ async def visualization_agent(df, date_col, target_col, group_col):
 async def business_metrics_agent(df, target_col, group_col):
     out = {"kpis": {}, "group_summary": None}
 
-    if target_col:
-        s = pd.to_numeric(df[target_col], errors="coerce").dropna()
-        out["kpis"] = {
-            "total": round(float(s.sum()), 3),
-            "mean": round(float(s.mean()), 3),
-            "median": round(float(s.median()), 3),
-            "min": round(float(s.min()), 3),
-            "max": round(float(s.max()), 3),
-            "count": int(s.count())
-        }
+    # ✅ HARD VALIDATION — prevent KeyError permanently
+    if not target_col or target_col not in df.columns:
+        return out
 
-    if target_col and group_col:
+    s = pd.to_numeric(df[target_col], errors="coerce").dropna()
+
+    if s.empty:
+        return out
+
+    out["kpis"] = {
+        "total": round(float(s.sum()), 3),
+        "mean": round(float(s.mean()), 3),
+        "median": round(float(s.median()), 3),
+        "min": round(float(s.min()), 3),
+        "max": round(float(s.max()), 3),
+        "count": int(s.count())
+    }
+
+    if group_col and group_col in df.columns:
         out["group_summary"] = (
             df.groupby(group_col)[target_col]
             .sum()
@@ -211,6 +224,12 @@ OUTPUT FORMAT (STRICT JSON):
 
 # ---------------------- ORCHESTRATOR ---------------------- #
 async def run_all_agents(df, date_col, target_col, group_col):
+
+    # ✅ SANITIZE SELECTIONS FROM STREAMLIT STATE
+    date_col = date_col if date_col in df.columns else None
+    target_col = target_col if target_col in df.columns else None
+    group_col = group_col if group_col in df.columns else None
+
     v_task = asyncio.create_task(visualization_agent(df, date_col, target_col, group_col))
     m_task = asyncio.create_task(business_metrics_agent(df, target_col, group_col))
     c_task = asyncio.create_task(correlation_agent(df))
@@ -219,7 +238,6 @@ async def run_all_agents(df, date_col, target_col, group_col):
     s = await summary_agent_gemini(df, m, c, target_col, group_col)
 
     return {"visualizations": v, "business_metrics": m, "correlations": c, "summary": s}
-
 # ---------------------- STREAMLIT UI ---------------------- #
 def main():
     st.set_page_config("Business Insights — Gemini", layout="wide")
@@ -281,4 +299,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
