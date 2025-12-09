@@ -4,3 +4,4 @@ numpy
 plotly
 openpyxl
 google-generativeai
+xlrd>=2.0.1
