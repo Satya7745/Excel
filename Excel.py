@@ -15,7 +15,7 @@ def configure_gemini():
     if not key:
         return None
     genai.configure(api_key=key)
-    return genai.GenerativeModel("gemini-1.5-flash")
+    return genai.GenerativeModel("gemini-2.5-flash")
 
 # ---------------------- Utility Functions ---------------------- #
 @st.cache_data
@@ -199,3 +199,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
