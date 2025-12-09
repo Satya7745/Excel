@@ -1,17 +1,19 @@
 import os
 import asyncio
-from typing import List
-from io import BytesIO
+import json
 import re
+from io import BytesIO
 
 import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.express as px
 import google.generativeai as genai
-import json
 
-# ---------------------- Gemini Setup ---------------------- #
+
+# =========================
+# ✅ GEMINI SETUP
+# =========================
 @st.cache_resource
 def configure_gemini():
     key = os.getenv("GEMINI_API_KEY")
@@ -20,284 +22,228 @@ def configure_gemini():
     genai.configure(api_key=key)
     return genai.GenerativeModel("gemini-2.5-flash")
 
-# ---------------------- Utility Functions ---------------------- #
+
+# =========================
+# ✅ EXCEL CLEANER (UNSTRUCTURED SAFE)
+# =========================
 @st.cache_data
-def load_data(file) -> pd.DataFrame:
+def load_and_clean_excel(file) -> pd.DataFrame:
     try:
-        fname = file.name.lower()
         file.seek(0)
         raw = file.read()
 
-        # 🚨 SharePoint HTML detection
+        # --- Block HTML masquerading as Excel ---
         if raw[:50].lower().startswith(b"<html") or b"<!doctype html" in raw[:200].lower():
-            st.error("Invalid Excel: SharePoint returned HTML instead of real file.")
-            st.code(raw[:300])
+            st.error("Invalid Excel file (SharePoint returned HTML)")
             return pd.DataFrame()
 
         bio = BytesIO(raw)
 
-        # ✅ Load all sheets WITHOUT assuming headers
-        if fname.endswith((".xlsx", ".xlsm", ".xlsb")):
-            sheets = pd.read_excel(bio, sheet_name=None, engine="openpyxl", header=None)
-        elif fname.endswith(".xls"):
-            sheets = pd.read_excel(bio, sheet_name=None, engine="xlrd", header=None)
-        elif fname.endswith(".csv"):
-            return pd.read_csv(bio)
-        else:
-            st.error("Unsupported file format.")
-            return pd.DataFrame()
+        # --- Load all sheets without assuming headers ---
+        sheets = pd.read_excel(bio, sheet_name=None, header=None, engine="openpyxl")
 
-        def extract_real_table(df_raw: pd.DataFrame) -> pd.DataFrame:
+        def extract_table(df_raw: pd.DataFrame):
             df_raw = df_raw.dropna(how="all")
 
-            # ✅ Find first row that looks like a header
             header_idx = None
             for i in range(len(df_raw)):
-                non_nulls = df_raw.iloc[i].notna().sum()
-                if non_nulls >= 3:   # heuristic: header must have ≥3 values
+                if df_raw.iloc[i].notna().sum() >= 3:
                     header_idx = i
                     break
 
             if header_idx is None:
-                return pd.DataFrame()
+                return None
 
             df = df_raw.iloc[header_idx + 1:].copy()
             df.columns = df_raw.iloc[header_idx]
-
-            # ✅ Drop empty columns + Unnamed artifacts
             df = df.dropna(axis=1, how="all")
             df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed")]
-
             return df.reset_index(drop=True)
 
         df_list = []
-
-        for sheet, df_raw in sheets.items():
-            clean_df = extract_real_table(df_raw)
-            if not clean_df.empty:
-                clean_df["__sheet_name"] = sheet
+        for name, sheet in sheets.items():
+            clean_df = extract_table(sheet)
+            if clean_df is not None and not clean_df.empty:
+                clean_df["__sheet_name"] = name
                 df_list.append(clean_df)
 
         if not df_list:
-            st.error("No structured tables could be detected in this file.")
             return pd.DataFrame()
 
         return pd.concat(df_list, ignore_index=True)
 
     except Exception as e:
-        st.error(f"Excel parsing failed: {e}")
+        st.error(str(e))
         return pd.DataFrame()
 
-def detect_date_columns(df: pd.DataFrame) -> List[str]:
-    cols = []
-    for c in df.columns:
-        parsed = pd.to_datetime(df[c], errors="coerce")
-        if parsed.notna().mean() > 0.85:
-            cols.append(c)
-    return cols
 
-def get_numeric_and_categorical(df):
-    numeric = df.select_dtypes(include=["number"]).columns.tolist()
-    cat = df.select_dtypes(include=["object", "category"]).columns.tolist()
-    return numeric, cat
-
-# ---------------------- AGENTS ---------------------- #
-async def visualization_agent(df, date_col, target_col, group_col):
-    out = {"time_series": None, "distributions": [], "category_charts": []}
-
-    # ✅ HARD COLUMN EXISTENCE CHECK
-    if date_col in df.columns and target_col in df.columns:
-        tmp = df[[date_col, target_col]].dropna()
-        if not tmp.empty:
-            tmp[date_col] = pd.to_datetime(tmp[date_col], errors="coerce")
-            out["time_series"] = px.line(tmp, x=date_col, y=target_col)
-
-    numeric, _ = get_numeric_and_categorical(df)
-
-    for col in numeric[:6]:
-        out["distributions"].append((col, px.histogram(df, x=col)))
-
-    if (
-        target_col in df.columns
-        and group_col in df.columns
-    ):
-        grp = df.groupby(group_col)[target_col].mean().reset_index()
-        out["category_charts"].append(px.bar(grp, x=group_col, y=target_col))
-
-    return out
-
-async def business_metrics_agent(df, target_col, group_col):
-    out = {"kpis": {}, "group_summary": None}
-
-    # ✅ HARD VALIDATION — prevent KeyError permanently
-    if not target_col or target_col not in df.columns:
-        return out
-
-    s = pd.to_numeric(df[target_col], errors="coerce").dropna()
-
-    if s.empty:
-        return out
-
-    out["kpis"] = {
-        "total": round(float(s.sum()), 3),
-        "mean": round(float(s.mean()), 3),
-        "median": round(float(s.median()), 3),
-        "min": round(float(s.min()), 3),
-        "max": round(float(s.max()), 3),
-        "count": int(s.count())
-    }
-
-    if group_col and group_col in df.columns:
-        out["group_summary"] = (
-            df.groupby(group_col)[target_col]
-            .sum()
-            .reset_index()
-            .to_dict(orient="records")
-        )
-
-    return out
-
-async def correlation_agent(df):
-    out = {"corr_matrix": None, "top_pairs": []}
+# =========================
+# ✅ AGENT 1 — METRICS
+# =========================
+def metrics_agent(df: pd.DataFrame):
     numeric = df.select_dtypes(include=["number"])
 
-    if numeric.shape[1] > 1:
-        corr = numeric.corr()
-        out["corr_matrix"] = corr
+    metrics = {}
+    for col in numeric.columns:
+        s = numeric[col].dropna()
+        if not s.empty:
+            metrics[col] = {
+                "mean": float(s.mean()),
+                "sum": float(s.sum()),
+                "min": float(s.min()),
+                "max": float(s.max()),
+                "count": int(s.count()),
+            }
+    return metrics
 
-        pairs = corr.abs().unstack().reset_index()
-        pairs.columns = ["x", "y", "corr"]
-        pairs = pairs[pairs["x"] != pairs["y"]]
-        pairs = pairs.sort_values("corr", ascending=False)
-        out["top_pairs"] = pairs.head(8).to_dict(orient="records")
 
-    return out
+# =========================
+# ✅ AGENT 2 — CORRELATION
+# =========================
+def correlation_agent(df: pd.DataFrame):
+    numeric = df.select_dtypes(include=["number"])
+    if numeric.shape[1] < 2:
+        return None, []
 
-# ---------------------- HALLUCINATION-SAFE LLM ---------------------- #
-async def summary_agent_gemini(df, metrics, corr, target_col, group_col):
+    corr = numeric.corr()
+
+    pairs = corr.abs().unstack().reset_index()
+    pairs.columns = ["x", "y", "corr"]
+    pairs = pairs[pairs["x"] != pairs["y"]]
+    pairs = pairs.sort_values("corr", ascending=False)
+
+    return corr, pairs.head(10).to_dict(orient="records")
+
+
+# =========================
+# ✅ AGENT 3 — DYNAMIC VISUALIZATION
+# =========================
+def visualization_agent(df: pd.DataFrame):
+    visuals = []
+
+    numeric = df.select_dtypes(include=["number"]).columns.tolist()
+    categorical = df.select_dtypes(include=["object", "category"]).columns.tolist()
+
+    # Auto histogram for all numeric columns
+    for col in numeric:
+        visuals.append(px.histogram(df, x=col, title=f"Distribution of {col}"))
+
+    # Auto bar charts for categorical vs numeric
+    if categorical and numeric:
+        for cat in categorical[:2]:
+            for num in numeric[:2]:
+                grp = df.groupby(cat)[num].mean().reset_index()
+                visuals.append(
+                    px.bar(grp, x=cat, y=num, title=f"{num} by {cat}")
+                )
+
+    return visuals
+
+
+# =========================
+# ✅ AGENT 4 — STRICT INSIGHT LLM (NO HALLUCINATION)
+# =========================
+async def insight_agent(df, metrics, corr_pairs):
     model = configure_gemini()
     if model is None:
-        return {"llm_report": "Gemini API Key not configured."}
+        return {"error": "Gemini API key missing"}
 
-    # 🚨 STRICT ANTI-HALLUCINATION PROMPT
     prompt = f"""
-You are a strict financial and data analyst.
+You are a strict data analyst.
 
-You are ONLY allowed to use the facts provided below.
-You are NOT allowed to invent data, assume trends, or generalize.
-If evidence is missing, explicitly state "INSUFFICIENT DATA".
+You are ONLY allowed to use the following facts.
+DO NOT invent numbers or trends.
+If data is insufficient, say "INSUFFICIENT DATA".
 
-FACTUAL INPUT:
-Dataset Shape: {df.shape}
-Target KPI: {target_col}
-Group Column: {group_col}
-KPI Metrics: {json.dumps(metrics.get("kpis"), indent=2)}
-Group Summary: {json.dumps(metrics.get("group_summary"), indent=2)}
-Top Correlations: {json.dumps(corr.get("top_pairs"), indent=2)}
+METRICS:
+{json.dumps(metrics, indent=2)}
 
-OUTPUT FORMAT (STRICT JSON):
+TOP CORRELATIONS:
+{json.dumps(corr_pairs, indent=2)}
+
+Respond ONLY in this strict JSON:
+
 {{
-  "executive_summary": "...",
-  "key_insights": [
-      {{"statement": "...", "evidence": "...", "confidence": 0.0-1.0}}
+  "summary": "...",
+  "insights": [
+      {{"statement": "...", "evidence": "..."}}
   ],
   "risks": [
-      {{"statement": "...", "evidence": "...", "confidence": 0.0-1.0}}
+      {{"statement": "...", "evidence": "..."}}
   ],
   "recommendations": [
-      {{"action": "...", "justification": "...", "confidence": 0.0-1.0}}
+      {{"action": "...", "justification": "..."}}
   ]
 }}
 """
 
     response = await asyncio.to_thread(model.generate_content, prompt)
-    raw_text = getattr(response, "text", "")
+    txt = getattr(response, "text", "")
 
-    # ✅ HARD JSON EXTRACTION
     try:
-        clean_json = re.search(r"\{.*\}", raw_text, re.S).group(0)
-        parsed = json.loads(clean_json)
+        clean_json = re.search(r"\{.*\}", txt, re.S).group(0)
+        return json.loads(clean_json)
     except Exception:
-        parsed = {"error": "Model returned non-JSON. Insights blocked to avoid hallucination."}
+        return {"error": "Model output rejected to prevent hallucination."}
 
-    return parsed
 
-# ---------------------- ORCHESTRATOR ---------------------- #
-async def run_all_agents(df, date_col, target_col, group_col):
-
-    # ✅ SANITIZE SELECTIONS FROM STREAMLIT STATE
-    date_col = date_col if date_col in df.columns else None
-    target_col = target_col if target_col in df.columns else None
-    group_col = group_col if group_col in df.columns else None
-
-    v_task = asyncio.create_task(visualization_agent(df, date_col, target_col, group_col))
-    m_task = asyncio.create_task(business_metrics_agent(df, target_col, group_col))
-    c_task = asyncio.create_task(correlation_agent(df))
-
-    v, m, c = await asyncio.gather(v_task, m_task, c_task)
-    s = await summary_agent_gemini(df, m, c, target_col, group_col)
-
-    return {"visualizations": v, "business_metrics": m, "correlations": c, "summary": s}
-# ---------------------- STREAMLIT UI ---------------------- #
+# =========================
+# ✅ STREAMLIT UI
+# =========================
 def main():
-    st.set_page_config("Business Insights — Gemini", layout="wide")
-    st.title("Business & Work Insights — No-Hallucination AI")
+    st.set_page_config("Business Insights — Multi-Agent AI", layout="wide")
+    st.title("Business & Work Insights — Cleaned & Enriched")
 
-    uploaded = st.sidebar.file_uploader("Upload CSV or Excel", ["csv", "xls", "xlsx"])
+    uploaded = st.sidebar.file_uploader("Upload Excel", ["xlsx", "xlsm", "xls"])
 
     if not uploaded:
-        st.info("Upload a file to begin.")
+        st.info("Upload an Excel file to start")
         return
 
-    df = load_data(uploaded)
+    df = load_and_clean_excel(uploaded)
+
     if df.empty:
+        st.error("No usable table detected in this Excel")
         return
 
-    numeric, cat = get_numeric_and_categorical(df)
-    date_cols = detect_date_columns(df)
+    st.success("Excel cleaned successfully")
 
-    date_col = st.sidebar.selectbox("Date Column", ["None"] + date_cols)
-    target_col = st.sidebar.selectbox("Target KPI", numeric)
-    group_col = st.sidebar.selectbox("Group Column", ["None"] + cat)
+    with st.expander("🔍 Preview Cleaned Data"):
+        st.dataframe(df)
 
-    date_col = None if date_col == "None" else date_col
-    group_col = None if group_col == "None" else group_col
-
-    if not st.sidebar.button("Run Analysis"):
+    if not st.sidebar.button("Run Multi-Agent Analysis"):
         return
 
-    with st.spinner("Running verified analysis..."):
-        results = asyncio.run(run_all_agents(df, date_col, target_col, group_col))
+    with st.spinner("Running agents..."):
 
-    viz, metrics, corr, summary = (
-        results["visualizations"],
-        results["business_metrics"],
-        results["correlations"],
-        results["summary"],
-    )
+        metrics = metrics_agent(df)
+        corr_matrix, corr_pairs = correlation_agent(df)
+        visuals = visualization_agent(df)
+        insights = asyncio.run(insight_agent(df, metrics, corr_pairs))
 
-    t1,t2,t3,t4,t5 = st.tabs(["Verified Insights","Visuals","KPIs","Correlations","Data"])
+    tabs = st.tabs(["Insights", "Visuals", "Metrics", "Correlations", "Data"])
 
-    with t1:
-        st.json(summary)
+    with tabs[0]:
+        st.json(insights)
 
-    with t2:
-        if viz["time_series"]:
-            st.plotly_chart(viz["time_series"])
-        for _, fig in viz["distributions"]:
-            st.plotly_chart(fig)
+    with tabs[1]:
+        for fig in visuals:
+            st.plotly_chart(fig, use_container_width=True)
 
-    with t3:
+    with tabs[2]:
         st.json(metrics)
 
-    with t4:
-        if corr["corr_matrix"] is not None:
-            st.dataframe(corr["corr_matrix"])
+    with tabs[3]:
+        if corr_matrix is not None:
+            st.dataframe(corr_matrix)
 
-    with t5:
+    with tabs[4]:
         st.dataframe(df)
+        st.download_button("Download Clean CSV",
+                           df.to_csv(index=False),
+                           "cleaned_data.csv",
+                           "text/csv")
+
 
 if __name__ == "__main__":
     main()
-
-
