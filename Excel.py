@@ -22,80 +22,49 @@ def configure_gemini():
 # ---------------------- Utility Functions ---------------------- #
 @st.cache_data
 def load_data(file) -> pd.DataFrame:
-    """
-    Robust loader for CSV / Excel files coming from Streamlit uploader.
-    - Accepts multi-sheet Excel files and concatenates all sheets, adding a `__sheet_name` column.
-    - Detects HTML payloads (common when SharePoint returns a login page or error page).
-    - Tries pandas default engine first, then falls back to openpyxl / xlrd.
-    """
     try:
-        fname = (file.name or "").lower()
-        # CSV: let pandas handle the uploaded file-like object directly
-        if fname.endswith(".csv"):
-            file.seek(0)
-            return pd.read_csv(file)
-
-        # Read raw bytes (safe for in-memory and file objects)
+        fname = file.name.lower()
         file.seek(0)
-        content = file.read()
-        if not content:
-            st.error("Uploaded file is empty.")
+        raw = file.read()
+
+        # --- Detect HTML instead of Excel (SharePoint auth failure) ---
+        if raw[:50].lower().startswith(b"<html") or b"<!doctype html" in raw[:200].lower():
+            st.error("SharePoint returned an HTML page instead of an Excel file (authentication or permission issue).")
+            st.code(raw[:300])
             return pd.DataFrame()
 
-        head = content[:512].lower()
+        bio = BytesIO(raw)
 
-        # Detect HTML / login pages from SharePoint (common root cause)
-        if b"<html" in head or b"<!doctype html" in head:
-            st.error(
-                "Uploaded file appears to be HTML (SharePoint may have returned a login/error page). "
-                "Confirm the download/authentication and re-upload the actual Excel file."
-            )
-            # Optionally log the first bytes for debugging
-            st.write("Preview of file head (first 200 bytes):")
-            st.code(head[:200])
-            return pd.DataFrame()
+        # --- Force modern Excel engine ONLY ---
+        if fname.endswith((".xlsx", ".xlsm", ".xlsb")):
+            sheets = pd.read_excel(bio, sheet_name=None, engine="openpyxl")
 
-        bio = BytesIO(content)
+        elif fname.endswith(".xls"):
+            sheets = pd.read_excel(bio, sheet_name=None, engine="xlrd")
 
-        # Try reading all sheets (sheet_name=None returns dict of DataFrames)
-        try:
-            sheets = pd.read_excel(bio, sheet_name=None)
-        except Exception as ex:
-            # Try common explicit engines as fallbacks
+        elif fname.endswith(".csv"):
             bio.seek(0)
-            try:
-                sheets = pd.read_excel(bio, sheet_name=None, engine="openpyxl")
-            except Exception:
-                bio.seek(0)
-                try:
-                    sheets = pd.read_excel(bio, sheet_name=None, engine="xlrd")
-                except Exception as final_ex:
-                    st.error(f"File error while parsing Excel: {final_ex}")
-                    return pd.DataFrame()
+            return pd.read_csv(bio)
 
-        # If pandas returned a dict (multiple sheets), concatenate
-        if isinstance(sheets, dict):
-            df_list = []
-            for sheet_name, df in sheets.items():
-                if df is None or df.empty:
-                    continue
-                df_copy = df.copy()
-                # Preserve sheet source
-                df_copy["__sheet_name"] = sheet_name
-                df_list.append(df_copy)
+        else:
+            st.error("Unsupported file format.")
+            return pd.DataFrame()
 
-            if not df_list:
-                st.warning("No sheets with data were found in the uploaded Excel file.")
-                return pd.DataFrame()
+        # --- Merge ALL sheets safely ---
+        df_list = []
+        for sheet, df in sheets.items():
+            if not df.empty:
+                df["__sheet_name"] = sheet
+                df_list.append(df)
 
-            combined = pd.concat(df_list, ignore_index=True, sort=False)
-            return combined
+        if not df_list:
+            st.warning("Excel file contains no usable data.")
+            return pd.DataFrame()
 
-        # Otherwise, single DataFrame returned
-        return sheets
+        return pd.concat(df_list, ignore_index=True)
 
     except Exception as e:
-        st.error(f"File error: {e}")
+        st.error(f"Excel parsing failed: {e}")
         return pd.DataFrame()
 
 def detect_date_columns(df: pd.DataFrame) -> List[str]:
@@ -296,3 +265,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
