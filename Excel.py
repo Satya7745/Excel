@@ -1,7 +1,8 @@
 import os
 import asyncio
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List
 from io import BytesIO
+import re
 
 import pandas as pd
 import numpy as np
@@ -27,39 +28,29 @@ def load_data(file) -> pd.DataFrame:
         file.seek(0)
         raw = file.read()
 
-        # --- Detect HTML instead of Excel (SharePoint auth failure) ---
+        # 🚨 SharePoint HTML detection
         if raw[:50].lower().startswith(b"<html") or b"<!doctype html" in raw[:200].lower():
-            st.error("SharePoint returned an HTML page instead of an Excel file (authentication or permission issue).")
+            st.error("Invalid Excel: SharePoint returned HTML instead of real file.")
             st.code(raw[:300])
             return pd.DataFrame()
 
         bio = BytesIO(raw)
 
-        # --- Force modern Excel engine ONLY ---
         if fname.endswith((".xlsx", ".xlsm", ".xlsb")):
             sheets = pd.read_excel(bio, sheet_name=None, engine="openpyxl")
-
         elif fname.endswith(".xls"):
             sheets = pd.read_excel(bio, sheet_name=None, engine="xlrd")
-
         elif fname.endswith(".csv"):
-            bio.seek(0)
             return pd.read_csv(bio)
-
         else:
             st.error("Unsupported file format.")
             return pd.DataFrame()
 
-        # --- Merge ALL sheets safely ---
         df_list = []
         for sheet, df in sheets.items():
             if not df.empty:
                 df["__sheet_name"] = sheet
                 df_list.append(df)
-
-        if not df_list:
-            st.warning("Excel file contains no usable data.")
-            return pd.DataFrame()
 
         return pd.concat(df_list, ignore_index=True)
 
@@ -70,12 +61,9 @@ def load_data(file) -> pd.DataFrame:
 def detect_date_columns(df: pd.DataFrame) -> List[str]:
     cols = []
     for c in df.columns:
-        try:
-            parsed = pd.to_datetime(df[c], errors="coerce")
-            if parsed.notna().mean() > 0.85:
-                cols.append(c)
-        except:
-            pass
+        parsed = pd.to_datetime(df[c], errors="coerce")
+        if parsed.notna().mean() > 0.85:
+            cols.append(c)
     return cols
 
 def get_numeric_and_categorical(df):
@@ -88,91 +76,108 @@ async def visualization_agent(df, date_col, target_col, group_col):
     out = {"time_series": None, "distributions": [], "category_charts": []}
 
     if date_col and target_col:
-        try:
-            tmp = df[[date_col, target_col]].dropna()
-            tmp[date_col] = pd.to_datetime(tmp[date_col])
-            fig = px.line(tmp, x=date_col, y=target_col, title=f"{target_col} over time")
-            out["time_series"] = fig
-        except Exception:
-            pass
+        tmp = df[[date_col, target_col]].dropna()
+        tmp[date_col] = pd.to_datetime(tmp[date_col])
+        out["time_series"] = px.line(tmp, x=date_col, y=target_col)
 
-    numeric, cat = get_numeric_and_categorical(df)
+    numeric, _ = get_numeric_and_categorical(df)
     for col in numeric[:6]:
-        try:
-            fig = px.histogram(df, x=col, title=f"Distribution: {col}")
-            out["distributions"].append((col, fig))
-        except Exception:
-            pass
+        out["distributions"].append((col, px.histogram(df, x=col)))
 
     if target_col and group_col:
-        try:
-            grp = df.groupby(group_col)[target_col].mean().reset_index()
-            fig = px.bar(grp, x=group_col, y=target_col)
-            out["category_charts"].append(("Category Chart", fig))
-        except Exception:
-            pass
+        grp = df.groupby(group_col)[target_col].mean().reset_index()
+        out["category_charts"].append(px.bar(grp, x=group_col, y=target_col))
 
     return out
 
 async def business_metrics_agent(df, target_col, group_col):
     out = {"kpis": {}, "group_summary": None}
-    if target_col and target_col in df.columns:
+
+    if target_col:
         s = pd.to_numeric(df[target_col], errors="coerce").dropna()
         out["kpis"] = {
-            "Total": float(s.sum()) if not s.empty else 0.0,
-            "Average": float(s.mean()) if not s.empty else 0.0,
-            "Median": float(s.median()) if not s.empty else 0.0,
-            "Min": float(s.min()) if not s.empty else 0.0,
-            "Max": float(s.max()) if not s.empty else 0.0,
-            "Count": int(s.count()),
+            "total": round(float(s.sum()), 3),
+            "mean": round(float(s.mean()), 3),
+            "median": round(float(s.median()), 3),
+            "min": round(float(s.min()), 3),
+            "max": round(float(s.max()), 3),
+            "count": int(s.count())
         }
 
-    if group_col and group_col in df.columns:
-        try:
-            out["group_summary"] = df.groupby(group_col)[target_col].sum().reset_index()
-        except Exception:
-            out["group_summary"] = None
+    if target_col and group_col:
+        out["group_summary"] = (
+            df.groupby(group_col)[target_col]
+            .sum()
+            .reset_index()
+            .to_dict(orient="records")
+        )
 
     return out
 
 async def correlation_agent(df):
     out = {"corr_matrix": None, "top_pairs": []}
     numeric = df.select_dtypes(include=["number"])
+
     if numeric.shape[1] > 1:
         corr = numeric.corr()
         out["corr_matrix"] = corr
-        # find top absolute correlations (excluding self)
-        corr_abs = corr.abs().unstack().reset_index()
-        corr_abs.columns = ["x", "y", "corr"]
-        corr_abs = corr_abs[corr_abs["x"] != corr_abs["y"]]
-        corr_abs = corr_abs.sort_values("corr", ascending=False).drop_duplicates(subset=["corr"])
-        top = corr_abs.head(10).to_dict(orient="records")
-        out["top_pairs"] = top
+
+        pairs = corr.abs().unstack().reset_index()
+        pairs.columns = ["x", "y", "corr"]
+        pairs = pairs[pairs["x"] != pairs["y"]]
+        pairs = pairs.sort_values("corr", ascending=False)
+        out["top_pairs"] = pairs.head(8).to_dict(orient="records")
+
     return out
 
+# ---------------------- HALLUCINATION-SAFE LLM ---------------------- #
 async def summary_agent_gemini(df, metrics, corr, target_col, group_col):
     model = configure_gemini()
     if model is None:
         return {"llm_report": "Gemini API Key not configured."}
 
+    # 🚨 STRICT ANTI-HALLUCINATION PROMPT
     prompt = f"""
+You are a strict financial and data analyst.
+
+You are ONLY allowed to use the facts provided below.
+You are NOT allowed to invent data, assume trends, or generalize.
+If evidence is missing, explicitly state "INSUFFICIENT DATA".
+
+FACTUAL INPUT:
 Dataset Shape: {df.shape}
 Target KPI: {target_col}
 Group Column: {group_col}
-KPIs: {metrics.get('kpis')}
-Top Correlations: {corr.get('top_pairs')}
+KPI Metrics: {json.dumps(metrics.get("kpis"), indent=2)}
+Group Summary: {json.dumps(metrics.get("group_summary"), indent=2)}
+Top Correlations: {json.dumps(corr.get("top_pairs"), indent=2)}
 
-Provide:
-1. Executive Summary
-2. Key Insights
-3. Risks
-4. Actionable Recommendations
+OUTPUT FORMAT (STRICT JSON):
+{{
+  "executive_summary": "...",
+  "key_insights": [
+      {{"statement": "...", "evidence": "...", "confidence": 0.0-1.0}}
+  ],
+  "risks": [
+      {{"statement": "...", "evidence": "...", "confidence": 0.0-1.0}}
+  ],
+  "recommendations": [
+      {{"action": "...", "justification": "...", "confidence": 0.0-1.0}}
+  ]
+}}
 """
 
     response = await asyncio.to_thread(model.generate_content, prompt)
-    # `response` structure may vary depending on SDK version; adapt if needed
-    text = getattr(response, "text", None) or json.dumps(response, default=str)
-    return {"llm_report": text}
+    raw_text = getattr(response, "text", "")
+
+    # ✅ HARD JSON EXTRACTION
+    try:
+        clean_json = re.search(r"\{.*\}", raw_text, re.S).group(0)
+        parsed = json.loads(clean_json)
+    except Exception:
+        parsed = {"error": "Model returned non-JSON. Insights blocked to avoid hallucination."}
+
+    return parsed
 
 # ---------------------- ORCHESTRATOR ---------------------- #
 async def run_all_agents(df, date_col, target_col, group_col):
@@ -183,22 +188,14 @@ async def run_all_agents(df, date_col, target_col, group_col):
     v, m, c = await asyncio.gather(v_task, m_task, c_task)
     s = await summary_agent_gemini(df, m, c, target_col, group_col)
 
-    return {
-        "visualizations": v,
-        "business_metrics": m,
-        "correlations": c,
-        "summary": s,
-    }
+    return {"visualizations": v, "business_metrics": m, "correlations": c, "summary": s}
 
 # ---------------------- STREAMLIT UI ---------------------- #
 def main():
     st.set_page_config("Business Insights — Gemini", layout="wide")
-    st.title("Business & Work Insights — Multi-Agent AI (Gemini)")
+    st.title("Business & Work Insights — No-Hallucination AI")
 
-    uploaded = st.sidebar.file_uploader(
-        "Upload CSV or Excel (single file — multiple sheets allowed)", 
-        type=["csv", "xls", "xlsx", "xlsm", "xlsb"]
-    )
+    uploaded = st.sidebar.file_uploader("Upload CSV or Excel", ["csv", "xls", "xlsx"])
 
     if not uploaded:
         st.info("Upload a file to begin.")
@@ -208,26 +205,20 @@ def main():
     if df.empty:
         return
 
-    # Inform the user when data came from multiple sheets
-    if "__sheet_name" in df.columns:
-        st.sidebar.info("This Excel contained multiple sheets; all sheets were concatenated. Column `__sheet_name` indicates source sheet.")
-
     numeric, cat = get_numeric_and_categorical(df)
     date_cols = detect_date_columns(df)
 
     date_col = st.sidebar.selectbox("Date Column", ["None"] + date_cols)
-    target_col = st.sidebar.selectbox("Target KPI", ["None"] + numeric)
+    target_col = st.sidebar.selectbox("Target KPI", numeric)
     group_col = st.sidebar.selectbox("Group Column", ["None"] + cat)
 
     date_col = None if date_col == "None" else date_col
-    target_col = None if target_col == "None" else target_col
     group_col = None if group_col == "None" else group_col
 
     if not st.sidebar.button("Run Analysis"):
         return
 
-    with st.spinner("Running multi-agent analysis..."):
-        # Use asyncio.run; keep existing behaviour. If Streamlit environment already has loop, adjust accordingly.
+    with st.spinner("Running verified analysis..."):
         results = asyncio.run(run_all_agents(df, date_col, target_col, group_col))
 
     viz, metrics, corr, summary = (
@@ -237,17 +228,15 @@ def main():
         results["summary"],
     )
 
-    t1,t2,t3,t4,t5 = st.tabs(["Executive Summary","Visuals","KPIs","Correlations","Data"])
+    t1,t2,t3,t4,t5 = st.tabs(["Verified Insights","Visuals","KPIs","Correlations","Data"])
 
     with t1:
-        st.markdown(summary.get("llm_report","No output."))
+        st.json(summary)
 
     with t2:
         if viz["time_series"]:
             st.plotly_chart(viz["time_series"])
         for _, fig in viz["distributions"]:
-            st.plotly_chart(fig)
-        for _, fig in viz["category_charts"]:
             st.plotly_chart(fig)
 
     with t3:
@@ -259,10 +248,6 @@ def main():
 
     with t5:
         st.dataframe(df)
-        # Provide CSV download of the concatenated dataset
-        csv_bytes = df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV", csv_bytes, "data.csv", mime="text/csv")
 
 if __name__ == "__main__":
     main()
-
