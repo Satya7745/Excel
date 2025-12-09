@@ -36,21 +36,51 @@ def load_data(file) -> pd.DataFrame:
 
         bio = BytesIO(raw)
 
+        # ✅ Load all sheets WITHOUT assuming headers
         if fname.endswith((".xlsx", ".xlsm", ".xlsb")):
-            sheets = pd.read_excel(bio, sheet_name=None, engine="openpyxl")
+            sheets = pd.read_excel(bio, sheet_name=None, engine="openpyxl", header=None)
         elif fname.endswith(".xls"):
-            sheets = pd.read_excel(bio, sheet_name=None, engine="xlrd")
+            sheets = pd.read_excel(bio, sheet_name=None, engine="xlrd", header=None)
         elif fname.endswith(".csv"):
             return pd.read_csv(bio)
         else:
             st.error("Unsupported file format.")
             return pd.DataFrame()
 
+        def extract_real_table(df_raw: pd.DataFrame) -> pd.DataFrame:
+            df_raw = df_raw.dropna(how="all")
+
+            # ✅ Find first row that looks like a header
+            header_idx = None
+            for i in range(len(df_raw)):
+                non_nulls = df_raw.iloc[i].notna().sum()
+                if non_nulls >= 3:   # heuristic: header must have ≥3 values
+                    header_idx = i
+                    break
+
+            if header_idx is None:
+                return pd.DataFrame()
+
+            df = df_raw.iloc[header_idx + 1:].copy()
+            df.columns = df_raw.iloc[header_idx]
+
+            # ✅ Drop empty columns + Unnamed artifacts
+            df = df.dropna(axis=1, how="all")
+            df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed")]
+
+            return df.reset_index(drop=True)
+
         df_list = []
-        for sheet, df in sheets.items():
-            if not df.empty:
-                df["__sheet_name"] = sheet
-                df_list.append(df)
+
+        for sheet, df_raw in sheets.items():
+            clean_df = extract_real_table(df_raw)
+            if not clean_df.empty:
+                clean_df["__sheet_name"] = sheet
+                df_list.append(clean_df)
+
+        if not df_list:
+            st.error("No structured tables could be detected in this file.")
+            return pd.DataFrame()
 
         return pd.concat(df_list, ignore_index=True)
 
@@ -251,3 +281,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
